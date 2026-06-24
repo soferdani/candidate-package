@@ -70,7 +70,7 @@ An automated test suite with **83 tests** worth **115 points**. Run it at any ti
 
 | Layer | Technology |
 |-------|------------|
-| **Backend** | Node.js (TypeScript) **or** .NET (C#) — your choice |
+| **Backend** | Node.js (TypeScript) |
 | **Frontend** | React + TypeScript |
 | **Database** | PostgreSQL (provided) |
 | **Cache / Queuing** | Redis (provided, optional) |
