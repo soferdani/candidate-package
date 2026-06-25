@@ -34,8 +34,14 @@ await app.register(ordersRoutes);
 startWorker();
 
 const port = Number(process.env.PORT || 3000);
+// Bind dual-stack (IPv6 `::` with IPv4-mapped enabled) rather than IPv4-only `0.0.0.0`.
+// On Windows, `localhost` resolves to BOTH ::1 (IPv6, tried first) and 127.0.0.1 (IPv4).
+// If we listen only on 0.0.0.0, the client's first ::1 attempt has no listener, so HTTP
+// clients (curl, undici/fetch) pay the ~200ms Happy-Eyeballs fallback before retrying IPv4 —
+// which silently blew the 100ms p95 budget on GET /api/orders. Listening on `::` answers ::1
+// immediately and still accepts 127.0.0.1, eliminating the connect stall.
 app
-  .listen({ port, host: '0.0.0.0' })
+  .listen({ port, host: '::' })
   .then(() => console.log(`API listening on http://localhost:${port}`))
   .catch((err) => {
     console.error(err);
