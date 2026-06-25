@@ -9,6 +9,104 @@ Redis owns the asynchronous work.** Nothing that must be correct depends on Redi
 
 ---
 
+## 0. System at a glance
+
+### 0.1 How everything fits together
+
+```
+        ┌──────────────────────────────────────────────────────────────────┐
+        │                         React + Vite  (src/web)                    │
+        │   Orders table · Analytics dashboard · Supplier detail · Bulk UX   │
+        └──────────────┬───────────────────────────────▲────────────────────┘
+                       │  REST  /api/*  (JSON)          │  SSE  /api/events
+                       │  fetch (Vite proxy → :3000)    │  (live order/bulk events)
+                       ▼                                │
+        ┌──────────────────────────────────────────────┴────────────────────┐
+        │                    Fastify API  ·  one Node process  (:3000)        │
+        │                                                                     │
+        │   routes/                          events.ts                        │
+        │   ├─ orders   (list/get/patch/stats/anomalies)   in-memory Set of   │
+        │   ├─ suppliers(list/get/performance)             SSE connections    │
+        │   ├─ products (recursive category CTE)              ▲               │
+        │   ├─ bulk     (validate → enqueue → 202)            │ broadcast     │
+        │   ├─ jobs     (read job hash)                       │               │
+        │   └─ events   (SSE stream)                          │               │
+        │        │                │                           │               │
+        │   pg Pool (SQL)    enqueue job          ┌───────────┴──────────┐    │
+        │        │                │               │  bulk/worker.ts      │    │
+        │        │                │               │  BRPOP loop (async)  │    │
+        │        ▼                ▼               └──────┬────────┬──────┘    │
+        └────────┼────────────────┼──────────────────────┼────────┼──────────┘
+                 │                 │   RPUSH job id        │ pop    │ SQL update
+                 │                 ▼                       ▼        │
+        ┌────────▼────────┐   ┌───────────────────────────────┐    │
+        │  PostgreSQL 16  │   │            Redis 7            │     │
+        │  source of      │   │  • queue  (list)             │     │
+        │  truth:         │◀──┼──• job hash {total,done,fail}│     │
+        │  orders 50k,    │   │  • lock:order:<id> (SET NX)  │     │
+        │  suppliers,     │   └───────────────────────────────┘    │
+        │  products,      │                                        │
+        │  categories     │◀───────────────────────────────────────┘
+        └─────────────────┘     worker writes status back to Postgres
+```
+
+**Read it as two paths:**
+- **Synchronous (everything except bulk):** browser → Fastify route → `pg` query → JSON back. Fast,
+  simple, correct. A `PATCH` also fires an SSE `order_updated` event to connected clients.
+- **Asynchronous (bulk only):** browser → bulk route writes a job to Redis and returns `202`
+  immediately → a background worker drains the Redis queue, updates Postgres order-by-order, and
+  emits `bulk_completed` when done. The browser polls `GET /api/jobs/:id` for live progress.
+
+One process runs both the HTTP server and the worker loop. The worker uses a **separate Redis
+connection** because a connection parked in `BRPOP` (blocking pop) can't run other commands.
+
+### 0.2 Bulk action — sequence (the asynchronous path)
+
+```
+Browser            Bulk route          Redis                 Worker              Postgres
+  │                    │                  │                     │ (BRPOP waiting)   │
+  │ POST bulk-action   │                  │                     │                   │
+  │ {ids, approve}     │                  │                     │                   │
+  ├───────────────────▶│  HSET job hash   │                     │                   │
+  │                    ├─────────────────▶│ {total,0,0,         │                   │
+  │                    │  RPUSH job id     │  processing}        │                   │
+  │                    ├─────────────────▶│ ────── wakes ──────▶│                   │
+  │   202 {jobId}      │                  │                     │ for each order:   │
+  │◀───────────────────┤                  │  SET lock NX EX300  │                   │
+  │                    │                  │◀────────────────────┤ (dedup)           │
+  │ GET jobs/:id  ─────────────────────▶  │                     │ UPDATE status ───▶│
+  │   {processing,     │                  │  HINCRBY done/fail   │                   │
+  │    done:n}  ◀───────────────── reads  │◀────────────────────┤                   │
+  │        ⋮  (poll)   │                  │                     │ ...all orders done│
+  │                    │                  │  HSET status=done    │                   │
+  │  SSE bulk_completed │◀──────── emit ───────────────────────┤                   │
+  │◀───────────────────┤                  │                     │                   │
+```
+
+`202` comes back in milliseconds because **no order is touched on the request** — all the work
+happens in the worker afterward. That's how a 10,000-order action still answers under 500ms.
+
+### 0.3 Two simultaneous PATCH — why exactly one gets 409 (concurrency)
+
+```
+   Request A: PATCH status=approved        Request B: PATCH status=approved
+            │                                       │
+            ▼                                       ▼
+   ┌──────────────────────────── Postgres row lock on the order ───────────────┐
+   │  A acquires the row lock first:                                            │
+   │     UPDATE ... WHERE id=$ AND status IS DISTINCT FROM 'approved'           │
+   │     pending → approved   ✅ 1 row   →  HTTP 200                            │
+   │                                                                            │
+   │  B waited for the lock, now re-checks the SAME guard on the now-approved   │
+   │  row:  status IS DISTINCT FROM 'approved'  → false → 0 rows  →  HTTP 409   │
+   └────────────────────────────────────────────────────────────────────────────┘
+```
+
+No application-level lock and no read-then-write window — the single atomic `UPDATE` plus the
+row lock give the exact `[200, 409]` the spec requires. Full SQL in §4.
+
+---
+
 ## 1. Project structure
 
 ```
